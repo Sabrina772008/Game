@@ -10,7 +10,27 @@
 
 // ---- SETTINGS --------------------------------------------------------------
 export const DAILY_ROOM_URL = 'https://sabrina-family.daily.co/starbeans-wg6miwgwvedifm';
+const DAILY_JS = 'https://cdn.jsdelivr.net/npm/@daily-co/daily-js@0.92.2/dist/daily.js';
 // ---------------------------------------------------------------------------
+
+// index.html loads Daily, but if a device has an old cached page, load it here.
+let dailyLoading = null;
+function loadDaily() {
+  if (window.DailyIframe) return Promise.resolve(true);
+  if (!dailyLoading) {
+    dailyLoading = new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = DAILY_JS;
+      s.onload = () => resolve(!!window.DailyIframe);
+      s.onerror = () => {
+        dailyLoading = null;
+        resolve(false);
+      };
+      document.head.append(s);
+    });
+  }
+  return dailyLoading;
+}
 
 export class Call {
   constructor({ send, myId, userName, onChange, onError }) {
@@ -42,7 +62,7 @@ export class Call {
 
   async join() {
     if (this.inCall) return;
-    if (!window.DailyIframe) {
+    if (!(await loadDaily())) {
       this.onError('The video call could not load. Check your internet and refresh the page.');
       return;
     }
