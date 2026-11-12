@@ -1,136 +1,88 @@
-// Room voice/video call, powered by Daily.co (https://daily.co).
-//
-// Everyone in a game room joins the same Daily room automatically, with
-// camera and mic on, and stays in it the whole game (always-on call).
-// Daily carries all the audio and video; our own room only keeps track of who
-// is in the call so the lobby can show 🎤/📷 badges.
-//
-// No API key is used or needed here (GitHub Pages code is public, so a key
-// must never go in it). The room below was made in the Daily dashboard.
+import { ICE_SERVERS } from './net.js';
 
-// ---- SETTINGS --------------------------------------------------------------
-export const DAILY_ROOM_URL = 'https://sabrina-family.daily.co/starbeans-wg6miwgwvedifm';
-const DAILY_JS = 'https://cdn.jsdelivr.net/npm/@daily-co/daily-js@0.92.2/dist/daily.js';
-// ---------------------------------------------------------------------------
-
-// index.html loads Daily, but if a device has an old cached page, load it here.
-let dailyLoading = null;
-function loadDaily() {
-  if (window.DailyIframe) return Promise.resolve(true);
-  if (!dailyLoading) {
-    dailyLoading = new Promise((resolve) => {
-      const s = document.createElement('script');
-      s.src = DAILY_JS;
-      s.onload = () => resolve(!!window.DailyIframe);
-      s.onerror = () => {
-        dailyLoading = null;
-        resolve(false);
-      };
-      document.head.append(s);
-    });
-  }
-  return dailyLoading;
-}
+// Room voice/video call: a WebRTC "mesh" (everyone connects to everyone).
+// The server only relays signaling messages; audio/video go peer-to-peer
+// (or through your TURN server when a direct path isn't possible).
+// Mic and camera start OFF. Each peer connection is created with one audio
+// and one video slot up front, so turning devices on/off later just swaps the
+// track - no renegotiation needed, and the call survives screen changes.
 
 export class Call {
-  constructor({ send, myId, userName, onChange, onError }) {
+  constructor({ send, myId, onChange }) {
     this.send = send;
     this.myId = myId;
-    this.userName = userName || 'Player';
     this.onChange = onChange;
-    this.onError = onError || ((m) => console.warn(m));
     this.inCall = false;
+    this.peers = new Map(); // id -> { pc, stream, pendingIce, state }
+    this.mic = null; // MediaStreamTrack
+    this.cam = null;
     this.deafened = false;
-    this.peers = new Map(); // kept for app.js; Daily handles connections itself
-    this.co = null; // Daily call object
-    this.streams = new Map(); // game user id -> { stream, a, v }
-    this.lastMedia = '';
-  }
-
-  // ----- local tracks (app.js reads these) -----
-  #local() {
-    return this.co?.participants()?.local || null;
-  }
-  get mic() {
-    const t = this.#local()?.tracks?.audio;
-    return t && t.state === 'playable' ? t.persistentTrack : null;
-  }
-  get cam() {
-    const t = this.#local()?.tracks?.video;
-    return t && t.state === 'playable' ? t.persistentTrack : null;
+    this.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
   }
 
   async join() {
     if (this.inCall) return;
-    if (!(await loadDaily())) {
-      this.onError('The video call could not load. Check your internet and refresh the page.');
-      return;
-    }
+    this.iceServers = ICE_SERVERS;
     this.inCall = true;
     this.send({ t: 'call:join' });
     this.onChange();
-
-    const co = window.DailyIframe.createCallObject({ subscribeToTracksAutomatically: true });
-    this.co = co;
-    const update = () => {
-      this.#announce();
-      this.onChange();
-    };
-    for (const ev of ['joined-meeting', 'participant-joined', 'participant-updated', 'participant-left', 'track-started', 'track-stopped']) {
-      co.on(ev, update);
-    }
-    co.on('camera-error', (e) => this.onError(cameraError(e)));
-    co.on('error', (e) => {
-      this.onError(`Video call problem: ${e?.errorMsg || 'unknown error'}`);
-      this.leave();
-    });
-    co.on('left-meeting', () => {
-      if (this.co === co && this.inCall) this.leave();
-    });
-
-    try {
-      await co.join({
-        url: DAILY_ROOM_URL,
-        userName: this.userName,
-        userData: { gid: this.myId },
-        startAudioOff: false,
-        startVideoOff: false,
-      });
-    } catch (e) {
-      this.onError(`Couldn't join the video call: ${e?.errorMsg || e?.message || e}`);
-      this.leave();
-    }
   }
 
   leave() {
-    if (!this.inCall && !this.co) return;
-    const co = this.co;
-    this.co = null;
-    this.inCall = false;
-    this.streams.clear();
-    this.lastMedia = '';
+    if (!this.inCall) return;
     this.send({ t: 'call:leave' });
-    if (co) co.leave().catch(() => {}).finally(() => co.destroy().catch(() => {}));
+    this.#teardown();
+    this.#stopTrack('mic');
+    this.#stopTrack('cam');
     this.onChange();
   }
 
-  /** WebSocket dropped and came back: the room forgot we're in the call. */
+  /** WebSocket dropped and came back: the server forgot our call, so rejoin. */
   rejoinAfterReconnect() {
     if (!this.inCall) return;
+    this.#teardown();
+    this.inCall = true;
     this.send({ t: 'call:join' });
-    this.lastMedia = '';
     this.#announce();
     this.onChange();
   }
 
+  #teardown() {
+    for (const p of this.peers.values()) p.pc.close();
+    this.peers.clear();
+    this.inCall = false;
+  }
+
   async toggleMic() {
-    if (!this.co) return;
-    this.co.setLocalAudio(!this.co.localAudio());
+    if (this.mic) {
+      this.#stopTrack('mic');
+    } else {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        this.mic = s.getAudioTracks()[0];
+      } catch (e) {
+        throw new Error(mediaError(e, 'microphone'));
+      }
+    }
+    await this.#applyTracks();
+    this.#announce();
+    this.onChange();
   }
 
   async toggleCam() {
-    if (!this.co) return;
-    this.co.setLocalVideo(!this.co.localVideo());
+    if (this.cam) {
+      this.#stopTrack('cam');
+    } else {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240, frameRate: 20 } });
+        this.cam = s.getVideoTracks()[0];
+      } catch (e) {
+        throw new Error(mediaError(e, 'camera'));
+      }
+    }
+    await this.#applyTracks();
+    this.#announce();
+    this.onChange();
   }
 
   toggleDeafen() {
@@ -138,43 +90,121 @@ export class Call {
     this.onChange();
   }
 
-  #announce() {
-    if (!this.inCall) return;
-    const media = { mic: !!this.mic, cam: !!this.cam };
-    const key = JSON.stringify(media);
-    if (key === this.lastMedia) return;
-    this.lastMedia = key;
-    this.send({ t: 'call:media', ...media });
+  #stopTrack(which) {
+    if (this[which]) this[which].stop();
+    this[which] = null;
+    this.#applyTracks();
+    if (this.inCall) this.#announce();
   }
 
-  // Our room still sends call:peers / call:signal messages; Daily doesn't need them.
-  async handle() {
+  #announce() {
+    this.send({ t: 'call:media', mic: !!this.mic, cam: !!this.cam });
+  }
+
+  async #applyTracks() {
+    for (const p of this.peers.values()) await this.#applyTracksTo(p);
+  }
+
+  async #applyTracksTo(p) {
+    for (const tr of p.pc.getTransceivers()) {
+      const kind = tr.receiver.track?.kind;
+      if (!kind || tr.stopped) continue;
+      const track = kind === 'audio' ? this.mic : this.cam;
+      try {
+        if (tr.sender.track !== track) await tr.sender.replaceTrack(track);
+      } catch (e) {
+        console.warn('replaceTrack failed', e);
+      }
+    }
+  }
+
+  #peer(id) {
+    let p = this.peers.get(id);
+    if (p) return p;
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    p = { pc, stream: new MediaStream(), pendingIce: [], state: 'connecting' };
+    this.peers.set(id, p);
+    pc.onicecandidate = (e) => {
+      if (e.candidate) this.send({ t: 'call:signal', to: id, data: { ice: e.candidate } });
+    };
+    pc.ontrack = (e) => {
+      if (!p.stream.getTracks().includes(e.track)) p.stream.addTrack(e.track);
+      this.onChange();
+    };
+    pc.onconnectionstatechange = () => {
+      p.state = pc.connectionState;
+      this.onChange();
+    };
+    return p;
+  }
+
+  async #offer(id) {
+    const p = this.#peer(id);
+    p.pc.addTransceiver('audio', { direction: 'sendrecv' });
+    p.pc.addTransceiver('video', { direction: 'sendrecv' });
+    await this.#applyTracksTo(p);
+    const offer = await p.pc.createOffer();
+    await p.pc.setLocalDescription(offer);
+    this.send({ t: 'call:signal', to: id, data: { sdp: p.pc.localDescription } });
+  }
+
+  // ----- messages from the server -----
+  async handle(msg) {
+    if (!this.inCall) return;
+    switch (msg.t) {
+      case 'call:peers':
+        // The lower user id makes the offer, so every pair has exactly one offerer.
+        for (const id of msg.peers) {
+          this.#peer(id);
+          if (this.myId < id) await this.#offer(id);
+        }
+        this.#announce();
+        break;
+      case 'call:joined':
+        this.#peer(msg.userId);
+        if (this.myId < msg.userId) await this.#offer(msg.userId);
+        break;
+      case 'call:left': {
+        const p = this.peers.get(msg.userId);
+        if (p) p.pc.close();
+        this.peers.delete(msg.userId);
+        break;
+      }
+      case 'call:signal': {
+        const p = this.#peer(msg.from);
+        const { sdp, ice } = msg.data || {};
+        try {
+          if (sdp) {
+            await p.pc.setRemoteDescription(sdp);
+            if (sdp.type === 'offer') {
+              for (const tr of p.pc.getTransceivers()) tr.direction = 'sendrecv';
+              await this.#applyTracksTo(p);
+              const answer = await p.pc.createAnswer();
+              await p.pc.setLocalDescription(answer);
+              this.send({ t: 'call:signal', to: msg.from, data: { sdp: p.pc.localDescription } });
+            }
+            for (const c of p.pendingIce.splice(0)) await p.pc.addIceCandidate(c).catch(() => {});
+          } else if (ice) {
+            if (p.pc.remoteDescription) await p.pc.addIceCandidate(ice).catch(() => {});
+            else p.pendingIce.push(ice);
+          }
+        } catch (e) {
+          console.warn('signal error', e);
+        }
+        break;
+      }
+    }
     this.onChange();
   }
 
-  /** Audio + video of another player, matched by their game user id. */
-  streamFor(gid) {
-    if (!this.co) return null;
-    const p = Object.values(this.co.participants()).find((x) => !x.local && x.userData?.gid === gid);
-    if (!p) return null;
-    const pick = (t) => (t && t.state === 'playable' ? t.persistentTrack : null);
-    const a = pick(p.tracks?.audio);
-    const v = pick(p.tracks?.video);
-    let s = this.streams.get(gid);
-    // Keep the same MediaStream object unless the tracks changed, so videos don't flicker.
-    if (!s || s.a !== a || s.v !== v) {
-      s = { stream: new MediaStream([a, v].filter(Boolean)), a, v };
-      this.streams.set(gid, s);
-    }
-    return s.stream;
+  streamFor(id) {
+    return this.peers.get(id)?.stream || null;
   }
 }
 
-function cameraError(e) {
-  if (!window.isSecureContext) return 'Your browser only allows the camera and mic on https:// pages.';
-  const type = e?.error?.type || '';
-  if (type === 'permissions') return "Camera or mic permission was blocked. Allow it in your browser's site settings.";
-  if (type === 'not-found') return 'No camera or mic was found on this device.';
-  if (type === 'cam-in-use' || type === 'mic-in-use') return 'Another app is using the camera or mic.';
-  return `Camera/mic problem: ${e?.errorMsg || type || 'unknown'}`;
+function mediaError(e, what) {
+  if (!window.isSecureContext) return `Your browser only allows the ${what} on https:// pages or localhost.`;
+  if (e && e.name === 'NotAllowedError') return `Permission to use the ${what} was blocked. Allow it in your browser's site settings.`;
+  if (e && e.name === 'NotFoundError') return `No ${what} was found on this device.`;
+  return `Couldn't start the ${what}: ${e && e.message ? e.message : e}`;
 }

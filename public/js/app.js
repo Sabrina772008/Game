@@ -382,7 +382,7 @@ function onRoom(room) {
     toast(`You're in room ${room.code}`, 'good');
     // Always-on video call: join the Daily call as soon as you enter a room,
     // unless you pressed "Leave call" in this room earlier.
-    if (sessionStorage.getItem('fa_leftCall') !== room.code) state.call.join();
+    if (sessionStorage.getItem('fa_leftCall') !== room.code) joinCallWithMedia();
   }
   if (room.phase === 'lobby' && (state.view === 'results' || state.view === 'game' || state.view === 'home' || !wasIn)) {
     if (state.game) stopGame();
@@ -711,9 +711,24 @@ function renderCall() {
   }
 }
 
+// Always-on call: join and switch on the mic and camera straight away.
+async function joinCallWithMedia() {
+  await state.call.join();
+  try {
+    if (!state.call.mic) await state.call.toggleMic();
+  } catch (e) {
+    toast(e.message, 'bad', 6000);
+  }
+  try {
+    if (!state.call.cam) await state.call.toggleCam();
+  } catch (e) {
+    toast(e.message, 'bad', 6000);
+  }
+}
+
 $('btn-call-join').addEventListener('click', () => {
   sessionStorage.removeItem('fa_leftCall');
-  state.call.join();
+  joinCallWithMedia();
 });
 $('btn-call-leave').addEventListener('click', () => {
   sessionStorage.setItem('fa_leftCall', state.room.code);
