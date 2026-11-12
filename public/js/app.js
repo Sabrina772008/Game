@@ -77,34 +77,36 @@ for (const tab of document.querySelectorAll('#screen-auth .tab')) {
   });
 }
 
-// GitHub Pages version: no password server, so your player lives on this device.
-(function simplifyAuth() {
-  document.querySelector('#screen-auth .tabs')?.classList.add('hidden');
-  const pw = $('auth-form').password;
-  pw.required = false;
-  pw.closest('label').classList.add('hidden');
-  $('auth-form').username.closest('label').firstChild.textContent = 'Your player name ';
-  $('auth-form').username.minLength = 2;
-  $('auth-submit').textContent = "Let's play!";
-  const note = el('p', { class: 'muted', style: 'margin-top:10px;font-size:.9em' }, 'Your coins and avatar are saved on this device. Use the same name next time to get them back.');
+// Online accounts (Supabase): username + password, progress saved for any device.
+(function authNote() {
+  const note = el('p', { class: 'muted', style: 'margin-top:10px;font-size:.9em' }, 'Your coins, avatar and play time are saved online. Sign in with the same username on any phone or tablet.');
   $('auth-form').append(note);
 })();
 
-$('auth-form').addEventListener('submit', (e) => {
+$('auth-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('auth-error').textContent = '';
+  const btn = $('auth-submit');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Please wait…';
   try {
-    startSession(local.signIn(e.target.username.value));
+    const profile = await local.signIn(e.target.username.value, e.target.password.value, authMode);
+    e.target.password.value = '';
+    startSession(profile);
     enterPendingRoom();
   } catch (err) {
     $('auth-error').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
   }
 });
 
-$('btn-signout').textContent = 'Switch player';
-$('btn-signout').addEventListener('click', () => {
+$('btn-signout').textContent = 'Sign out';
+$('btn-signout').addEventListener('click', async () => {
   closeRoom();
-  local.signOut();
+  await local.signOut();
   location.href = location.pathname;
 });
 
@@ -783,8 +785,12 @@ window.addEventListener('beforeunload', (e) => {
     },
   });
   if (state.pendingRoom) $('join-code').value = state.pendingRoom;
-  const profile = local.currentProfile();
-  if (!profile) return show('auth');
-  startSession(profile);
-  enterPendingRoom();
+  local
+    .restore()
+    .catch(() => null)
+    .then((profile) => {
+      if (!profile) return show('auth');
+      startSession(profile);
+      enterPendingRoom();
+    });
 })();
