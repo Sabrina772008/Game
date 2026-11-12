@@ -1,5 +1,7 @@
 // Friend Arcade browser app: screens, lobby, games, results and the call dock.
-import { api, Socket } from './net.js';
+import { HostServer, LocalSocket, PeerSocket } from './net.js';
+import { makeCode } from './host.js';
+import * as local from './local.js';
 import { drawAvatar, avatarCanvas } from './avatar.js';
 import { Input, buildTouchControls } from './input.js';
 import { Call } from './call.js';
@@ -18,9 +20,10 @@ const GAME_INFO = {
 };
 
 const state = {
-  token: localStorage.getItem('fa_token'),
   profile: null,
   socket: null,
+  host: null, // HostServer when this tab runs the room
+  roomCode: null,
   room: null,
   view: null,
   game: null, // { type, matchId, renderer }
@@ -73,34 +76,35 @@ for (const tab of document.querySelectorAll('#screen-auth .tab')) {
   });
 }
 
-$('auth-form').addEventListener('submit', async (e) => {
+// GitHub Pages version: no password server, so your player lives on this device.
+(function simplifyAuth() {
+  document.querySelector('#screen-auth .tabs')?.classList.add('hidden');
+  const pw = $('auth-form').password;
+  pw.required = false;
+  pw.closest('label').classList.add('hidden');
+  $('auth-form').username.closest('label').firstChild.textContent = 'Your player name ';
+  $('auth-form').username.minLength = 2;
+  $('auth-submit').textContent = "Let's play!";
+  const note = el('p', { class: 'muted', style: 'margin-top:10px;font-size:.9em' }, 'Your coins and avatar are saved on this device. Use the same name next time to get them back.');
+  $('auth-form').append(note);
+})();
+
+$('auth-form').addEventListener('submit', (e) => {
   e.preventDefault();
-  const f = e.target;
   $('auth-error').textContent = '';
   try {
-    const data = await api(authMode === 'login' ? '/api/login' : '/api/signup', {
-      method: 'POST',
-      body: { username: f.username.value, password: f.password.value },
-    });
-    state.token = data.token;
-    localStorage.setItem('fa_token', data.token);
-    f.password.value = '';
-    startSession(data.profile);
+    startSession(local.signIn(e.target.username.value));
+    enterPendingRoom();
   } catch (err) {
     $('auth-error').textContent = err.message;
   }
 });
 
-$('btn-signout').addEventListener('click', async () => {
-  try {
-    await api('/api/logout', { method: 'POST', token: state.token });
-  } catch {
-    /* ignore */
-  }
-  state.call?.leave();
-  state.socket?.close();
-  localStorage.removeItem('fa_token');
-  location.href = '/';
+$('btn-signout').textContent = 'Switch player';
+$('btn-signout').addEventListener('click', () => {
+  closeRoom();
+  local.signOut();
+  location.href = location.pathname;
 });
 
 function startSession(profile) {
@@ -108,43 +112,120 @@ function startSession(profile) {
   renderProfile();
   state.input = new Input(send);
   state.call = new Call({ send, myId: profile.id, onChange: renderCall });
-  state.socket = new Socket(state.token, {
-    onMessage,
-    onOpen: () => {
-      $('conn').classList.add('hidden');
-      state.call.rejoinAfterReconnect();
-    },
-    onClose: () => $('conn').classList.remove('hidden'),
-  });
   show('home');
+}
+
+// ---------------------------------------------------------------- connecting to a room
+const publicProfile = () => ({ id: state.profile.id, username: state.profile.username, avatar: state.profile.avatar });
+
+function socketHandlers() {
+  return {
+    authProfile: publicProfile,
+    onMessage,
+    onOpen: () => $('conn').classList.add('hidden'),
+    onClose: () => $('conn').classList.remove('hidden'),
+    onGone: (reason) => {
+      $('conn').classList.add('hidden');
+      toast(reason, 'bad', 7000);
+      state.socket = null;
+      closeRoom();
+      onRoom(null);
+    },
+  };
+}
+
+function joinRoom(code) {
+  closeRoom();
+  state.roomCode = code;
+  $('conn').textContent = 'Connecting…';
+  $('conn').classList.remove('hidden');
+  state.socket = new PeerSocket(code, socketHandlers());
+}
+
+async function hostRoom(code) {
+  closeRoom();
+  $('conn').textContent = 'Opening your room…';
+  $('conn').classList.remove('hidden');
+  const fixed = !!code;
+  const started = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    const tryCode = code || makeCode();
+    const host = new HostServer();
+    try {
+      await host.start(tryCode, state.profile.id);
+      state.host = host;
+      state.roomCode = tryCode;
+      try {
+        sessionStorage.setItem('fa_host', tryCode);
+      } catch {
+        /* ignore */
+      }
+      state.socket = new LocalSocket(host, socketHandlers());
+      $('conn').classList.add('hidden');
+      $('conn').textContent = 'Reconnecting…';
+      return;
+    } catch (err) {
+      const taken = err && err.type === 'unavailable-id';
+      // After a refresh the old room name can stay reserved for a little while.
+      if (taken && fixed && Date.now() - started < 60000) {
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+      if (taken && !fixed && attempt < 5) continue;
+      $('conn').classList.add('hidden');
+      toast(
+        taken ? 'That room is still open somewhere else. Create a new room instead.' : `Couldn't open a room: ${err?.message || err?.type || err}. Check your internet and try again.`,
+        'bad',
+        7000,
+      );
+      try {
+        sessionStorage.removeItem('fa_host');
+      } catch {
+        /* ignore */
+      }
+      setUrlRoom(null);
+      return;
+    }
+  }
+}
+
+function closeRoom() {
+  state.socket?.close();
+  state.socket = null;
+  state.host?.stop(true);
+  state.host = null;
+  state.roomCode = null;
+  try {
+    sessionStorage.removeItem('fa_host');
+  } catch {
+    /* ignore */
+  }
 }
 
 // ---------------------------------------------------------------- socket messages
 function onMessage(msg) {
   switch (msg.t) {
     case 'hello':
-      state.profile = msg.profile;
-      renderProfile();
-      if (state.pendingRoom && !state.room) {
-        send({ t: 'room:join', code: state.pendingRoom });
-        state.pendingRoom = null;
-      }
+      if (state.roomCode) send({ t: 'room:join', code: state.roomCode });
+      state.call.rejoinAfterReconnect();
       break;
     case 'auth:fail':
-      localStorage.removeItem('fa_token');
-      state.socket.close();
-      toast('Please sign in again.', 'warn');
-      show('auth');
+      toast('Could not join with that player name.', 'bad');
+      closeRoom();
       break;
     case 'replaced':
       toast('You opened Friend Arcade in another tab or device. This tab is now disconnected.', 'warn', 8000);
       $('conn').textContent = 'Disconnected (open in another tab). Refresh to use this tab.';
       $('conn').classList.remove('hidden');
       break;
-    case 'profile':
-      state.profile = msg.profile;
-      renderProfile();
+    case 'award': {
+      const p = local.applyAward(state.profile, msg);
+      if (p) {
+        state.profile = p;
+        renderProfile();
+      }
       break;
+    }
     case 'room':
       onRoom(msg.room);
       break;
@@ -204,11 +285,11 @@ function renderProfile() {
   if (state.room) renderLobby();
 }
 
-$('btn-create').addEventListener('click', () => send({ t: 'room:create' }));
+$('btn-create').addEventListener('click', () => hostRoom());
 $('join-form').addEventListener('submit', (e) => {
   e.preventDefault();
   const code = $('join-code').value.trim().toUpperCase();
-  if (code.length === 5) send({ t: 'room:join', code });
+  if (code.length === 5) joinRoom(code);
   else toast('Room codes have 5 letters/numbers.', 'warn');
 });
 
@@ -221,8 +302,8 @@ $('btn-avatar').addEventListener('click', () => {
 $('btn-avatar-back').addEventListener('click', () => show(state.room ? 'lobby' : 'home'));
 $('btn-avatar-save').addEventListener('click', async () => {
   try {
-    const data = await api('/api/avatar', { method: 'PUT', token: state.token, body: { avatar: state.editor.avatar } });
-    state.profile = data.profile;
+    state.profile = local.setAvatar(state.profile, state.editor.avatar);
+    send({ t: 'profile:update', profile: publicProfile() });
     renderProfile();
     toast('Looking good! Saved.', 'good');
     show(state.room ? 'lobby' : 'home');
@@ -260,8 +341,7 @@ function renderEditor() {
               }
               if (!confirm(`Unlock ${item.name} for ${item.price} coins?`)) return;
               try {
-                const data = await api('/api/shop/buy', { method: 'POST', token: state.token, body: { itemId: item.id } });
-                state.profile = data.profile;
+                state.profile = local.buyItem(state.profile, item.id);
                 renderProfile();
                 toast(`Unlocked ${item.name}!`, 'good');
               } catch (e) {
@@ -286,6 +366,7 @@ function onRoom(room) {
   const wasIn = !!state.room;
   state.room = room;
   if (!room) {
+    closeRoom();
     setUrlRoom(null);
     sessionStorage.removeItem('fa_inCall');
     state.call.leave();
@@ -401,9 +482,17 @@ $('btn-ready').addEventListener('click', () => {
   send({ t: 'room:ready', ready: !me?.ready });
 });
 $('btn-start').addEventListener('click', () => send({ t: 'room:start' }));
-$('btn-leave-room').addEventListener('click', () => send({ t: 'room:leave' }));
+$('btn-leave-room').addEventListener('click', () => {
+  if (state.host) {
+    if (state.room && state.room.members.length > 1 && !confirm('You are hosting this room. If you leave, the room closes for everyone. Leave?')) return;
+    onRoom(null);
+    return;
+  }
+  send({ t: 'room:leave' });
+  setTimeout(() => state.room && onRoom(null), 1500);
+});
 $('btn-copy-link').addEventListener('click', async () => {
-  const link = `${location.origin}/?room=${state.room.code}`;
+  const link = `${location.origin}${location.pathname}?room=${state.room.code}`;
   try {
     await navigator.clipboard.writeText(link);
     toast('Invite link copied! Send it to your friends.', 'good');
@@ -637,14 +726,33 @@ $('btn-call-min').addEventListener('click', () => {
 });
 
 // ---------------------------------------------------------------- boot
-(async function boot() {
-  if (state.pendingRoom) $('join-code').value = state.pendingRoom;
-  if (!state.token) return show('auth');
+function enterPendingRoom() {
+  const code = state.pendingRoom && state.pendingRoom.toUpperCase();
+  state.pendingRoom = null;
+  if (!code) return;
+  let hosted = null;
   try {
-    const { profile } = await api('/api/me', { token: state.token });
-    startSession(profile);
+    hosted = sessionStorage.getItem('fa_host');
   } catch {
-    localStorage.removeItem('fa_token');
-    show('auth');
+    /* ignore */
   }
+  // Refreshed the page while hosting? Re-open the same room so friends reconnect.
+  if (hosted === code) hostRoom(code);
+  else joinRoom(code);
+}
+
+// The host's tab runs the room, so warn before closing it.
+window.addEventListener('beforeunload', (e) => {
+  if (state.host && state.room && state.room.members.length > 1) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+(function boot() {
+  if (state.pendingRoom) $('join-code').value = state.pendingRoom;
+  const profile = local.currentProfile();
+  if (!profile) return show('auth');
+  startSession(profile);
+  enterPendingRoom();
 })();

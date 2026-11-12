@@ -1,3 +1,5 @@
+import { ICE_SERVERS } from './net.js';
+
 // Room voice/video call: a WebRTC "mesh" (everyone connects to everyone).
 // The server only relays signaling messages; audio/video go peer-to-peer
 // (or through your TURN server when a direct path isn't possible).
@@ -20,13 +22,7 @@ export class Call {
 
   async join() {
     if (this.inCall) return;
-    try {
-      const res = await fetch('/api/config');
-      const cfg = await res.json();
-      if (Array.isArray(cfg.iceServers) && cfg.iceServers.length) this.iceServers = cfg.iceServers;
-    } catch {
-      /* keep defaults */
-    }
+    this.iceServers = ICE_SERVERS;
     this.inCall = true;
     this.send({ t: 'call:join' });
     this.onChange();
