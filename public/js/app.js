@@ -10,6 +10,7 @@ import { CATEGORIES, ITEMS, ITEM_BY_ID } from '/shared/cosmetics.js';
 import { TowerView, TOWER_HELP } from './games/tower.js';
 import { CircuitView, CIRCUIT_HELP } from './games/circuit.js';
 import { SabotageView, SABOTAGE_HELP } from './games/sabotage.js';
+import { startPlaytime } from './playtime.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -750,6 +751,21 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 (function boot() {
+  startPlaytime({
+    toast,
+    onBlock: () => {
+      // Time's up: leave the call, stop the game and close the room.
+      try {
+        state.call?.leave();
+        stopGame();
+        closeRoom();
+        if (state.call) onRoom(null);
+        setUrlRoom(null);
+      } catch (e) {
+        console.error(e);
+      }
+    },
+  });
   if (state.pendingRoom) $('join-code').value = state.pendingRoom;
   const profile = local.currentProfile();
   if (!profile) return show('auth');
