@@ -1,0 +1,18 @@
+{
+  "name": "friend-arcade",
+  "version": "1.0.0",
+  "description": "Private-room browser arcade: Spaceship Sabotage, Tower Rush and Circuit Sprint with accounts, avatars, coins and voice/video calls.",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
