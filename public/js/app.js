@@ -112,7 +112,7 @@ function startSession(profile) {
   state.profile = profile;
   renderProfile();
   state.input = new Input(send);
-  state.call = new Call({ send, myId: profile.id, onChange: renderCall });
+  state.call = new Call({ send, myId: profile.id, userName: profile.username, onChange: renderCall, onError: (m) => toast(m, 'bad', 6000) });
   show('home');
 }
 
@@ -369,7 +369,7 @@ function onRoom(room) {
   if (!room) {
     closeRoom();
     setUrlRoom(null);
-    sessionStorage.removeItem('fa_inCall');
+    sessionStorage.removeItem('fa_leftCall');
     state.call.leave();
     $('call').classList.add('hidden');
     if (state.game) stopGame();
@@ -380,8 +380,9 @@ function onRoom(room) {
   $('call').classList.remove('hidden');
   if (!wasIn) {
     toast(`You're in room ${room.code}`, 'good');
-    // Refreshed the page while in a call? Rejoin it (mic and camera stay off).
-    if (sessionStorage.getItem('fa_inCall') === room.code) state.call.join();
+    // Always-on video call: join the Daily call as soon as you enter a room,
+    // unless you pressed "Leave call" in this room earlier.
+    if (sessionStorage.getItem('fa_leftCall') !== room.code) state.call.join();
   }
   if (room.phase === 'lobby' && (state.view === 'results' || state.view === 'game' || state.view === 'home' || !wasIn)) {
     if (state.game) stopGame();
@@ -711,11 +712,11 @@ function renderCall() {
 }
 
 $('btn-call-join').addEventListener('click', () => {
-  sessionStorage.setItem('fa_inCall', state.room.code);
+  sessionStorage.removeItem('fa_leftCall');
   state.call.join();
 });
 $('btn-call-leave').addEventListener('click', () => {
-  sessionStorage.removeItem('fa_inCall');
+  sessionStorage.setItem('fa_leftCall', state.room.code);
   state.call.leave();
 });
 $('btn-mic').addEventListener('click', () => state.call.toggleMic().catch((e) => toast(e.message, 'bad', 6000)));
