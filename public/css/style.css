@@ -280,3 +280,12 @@ body.in-game .call-controls button { width: 100%; }
 @keyframes drop { from { transform: translateY(-10px); opacity: 0; } }
 .conn { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); background: var(--yellow); padding: 6px 14px; border-radius: 999px; z-index: 40; font-weight: 800; }
 .avatar-canvas { display: block; }
+
+/* daily play-time limit */
+.time-left { font-weight: 800; white-space: nowrap; }
+#time-block { position: fixed; inset: 0; z-index: 100; background: rgba(10, 5, 30, 0.94); display: flex; align-items: center; justify-content: center; padding: 16px; text-align: center; }
+#time-block.hidden { display: none; }
+#time-block .card { max-width: 420px; }
+#location-gate { position: fixed; inset: 0; z-index: 99; background: rgba(10, 5, 30, 0.94); display: flex; align-items: center; justify-content: center; padding: 16px; text-align: center; }
+#location-gate .card { max-width: 440px; }
+#location-gate button { margin-top: 10px; }
