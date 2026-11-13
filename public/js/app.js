@@ -67,39 +67,105 @@ function setUrlRoom(code) {
 
 // ---------------------------------------------------------------- auth
 let authMode = 'login';
-for (const tab of document.querySelectorAll('#screen-auth .tab')) {
-  tab.addEventListener('click', () => {
-    authMode = tab.dataset.mode;
-    for (const t of document.querySelectorAll('#screen-auth .tab')) t.classList.toggle('active', t === tab);
-    $('auth-submit').textContent = authMode === 'login' ? 'Sign in' : 'Create account';
-    $('auth-form').password.autocomplete = authMode === 'login' ? 'current-password' : 'new-password';
-    $('auth-error').textContent = '';
-  });
+let pendingEmail = '';
+const authForm = $('auth-form');
+const userLabel = authForm.username.closest('label');
+const passLabel = authForm.password.closest('label');
+userLabel.firstChild.textContent = 'Player name ';
+const emailLabel = document.createElement('label');
+emailLabel.innerHTML = 'Email <input name="email" type="text" inputmode="email" autocomplete="email" maxlength="120" />';
+authForm.insertBefore(emailLabel, userLabel);
+const codeBox = document.createElement('div');
+codeBox.innerHTML = '<p class="muted" id="code-info" style="margin:0 0 8px"></p>' +
+  '<label>Code from your email <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" /></label>' +
+  '<div style="display:flex;gap:8px;margin:6px 0 10px"><button type="button" class="ghost small" id="code-resend">Send a new code</button>' +
+  '<button type="button" class="ghost small" id="code-back">Back</button></div>';
+authForm.insertBefore(codeBox, $('auth-submit'));
+
+function setAuthView() {
+  const verifying = authMode === 'verify';
+  emailLabel.style.display = verifying ? 'none' : '';
+  passLabel.style.display = verifying ? 'none' : '';
+  userLabel.style.display = authMode === 'signup' ? '' : 'none';
+  codeBox.style.display = verifying ? '' : 'none';
+  authForm.email.required = !verifying;
+  authForm.password.required = !verifying;
+  authForm.username.required = authMode === 'signup';
+  authForm.code.required = verifying;
+  authForm.password.autocomplete = authMode === 'login' ? 'current-password' : 'new-password';
+  document.querySelector('#screen-auth .tabs').style.display = verifying ? 'none' : '';
+  $('auth-submit').textContent = verifying ? 'Verify' : authMode === 'login' ? 'Sign in' : 'Create account';
 }
 
-// Online accounts (Supabase): username + password, progress saved for any device.
+function showCodeStep(email, message) {
+  pendingEmail = email;
+  authMode = 'verify';
+  $('code-info').textContent = message || `We sent a code to ${email}. Type it below to finish.`;
+  authForm.code.value = '';
+  setAuthView();
+  authForm.code.focus();
+}
+
+function chooseTab(mode) {
+  authMode = mode;
+  for (const t of document.querySelectorAll('#screen-auth .tab')) t.classList.toggle('active', t.dataset.mode === mode);
+  $('auth-error').textContent = '';
+  setAuthView();
+}
+for (const tab of document.querySelectorAll('#screen-auth .tab')) {
+  tab.addEventListener('click', () => chooseTab(tab.dataset.mode));
+}
+$('code-back').addEventListener('click', () => chooseTab('login'));
+$('code-resend').addEventListener('click', async () => {
+  $('auth-error').textContent = '';
+  try {
+    await local.resendCode(pendingEmail);
+    $('code-info').textContent = `New code sent to ${pendingEmail}. Check your inbox (and spam).`;
+  } catch (err) {
+    $('auth-error').textContent = err.message;
+  }
+});
+setAuthView();
+
+// Online accounts (Supabase): email + password, verified with a code.
 (function authNote() {
-  const note = el('p', { class: 'muted', style: 'margin-top:10px;font-size:.9em' }, 'Your coins, avatar and play time are saved online. Sign in with the same username on any phone or tablet.');
-  $('auth-form').append(note);
+  const note = document.createElement('p');
+  note.className = 'muted';
+  note.style.cssText = 'margin-top:10px;font-size:.9em';
+  note.textContent = 'Your coins, avatar and play time are saved online. Sign in with your email on any phone or tablet.';
+  authForm.append(note);
 })();
 
-$('auth-form').addEventListener('submit', async (e) => {
+authForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   $('auth-error').textContent = '';
   const btn = $('auth-submit');
-  const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Please wait…';
   try {
-    const profile = await local.signIn(e.target.username.value, e.target.password.value, authMode);
-    e.target.password.value = '';
+    let profile;
+    if (authMode === 'verify') {
+      profile = await local.verifyCode(pendingEmail, authForm.code.value);
+    } else if (authMode === 'signup') {
+      profile = await local.signUp(authForm.email.value, authForm.username.value, authForm.password.value);
+      if (!profile) {
+        authForm.password.value = '';
+        showCodeStep(authForm.email.value.trim().toLowerCase());
+        return;
+      }
+    } else {
+      profile = await local.signIn(authForm.email.value, authForm.password.value);
+    }
+    authForm.password.value = '';
+    authMode = 'login';
     startSession(profile);
     enterPendingRoom();
   } catch (err) {
-    $('auth-error').textContent = err.message;
+    if (err.needsCode) showCodeStep(err.email, err.message);
+    else $('auth-error').textContent = err.message;
   } finally {
     btn.disabled = false;
-    btn.textContent = label;
+    setAuthView();
   }
 });
 

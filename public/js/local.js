@@ -104,26 +104,66 @@ export async function restore() {
   }
 }
 
-/** mode: 'login' or 'signup'. */
-export async function signIn(username, password, mode = 'login') {
-  const name = String(username || '').trim();
-  if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) throw new Error('Use 3-16 letters, numbers or _ for your username.');
-  if (String(password || '').length < 6) throw new Error('Your password needs at least 6 characters.');
-  const email = toEmail(name);
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const cleanEmail = (v) => String(v || '').trim().toLowerCase();
+function needsCode(email, message) {
+  const e = new Error(message);
+  e.needsCode = true;
+  e.email = email;
+  return e;
+}
 
-  let res;
-  if (mode === 'signup') {
-    res = await sb.auth.signUp({ email, password, options: { data: { username: name } } });
-    if (res.error) {
-      if (/already|registered|exists/i.test(res.error.message)) throw new Error('That username is taken. Pick another, or sign in.');
-      throw new Error(res.error.message);
+/** Make a new account. Returns the player, or null when an email code is needed. */
+export async function signUp(emailIn, username, password) {
+  const email = cleanEmail(emailIn);
+  const name = String(username || '').trim();
+  if (!EMAIL_RE.test(email)) throw new Error('Please type a real email address.');
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) throw new Error('Use 3-16 letters, numbers or _ for your player name.');
+  if (String(password || '').length < 6) throw new Error('Your password needs at least 6 characters.');
+  const res = await sb.auth.signUp({ email, password, options: { data: { username: name } } });
+  if (res.error) {
+    if (/already|registered|exists/i.test(res.error.message)) throw new Error('That email already has an account. Sign in instead.');
+    if (/rate limit/i.test(res.error.message)) throw new Error('Too many emails sent. Please wait a while and try again.');
+    throw new Error(res.error.message);
+  }
+  if (res.data.session) return loadPlayer(res.data.user);
+  const ids = res.data.user && res.data.user.identities;
+  if (Array.isArray(ids) && ids.length === 0) throw new Error('That email already has an account. Sign in instead.');
+  return null;
+}
+
+/** Sign in with email + password. */
+export async function signIn(emailIn, password) {
+  let email = cleanEmail(emailIn);
+  // Accounts made before emails were needed signed in with just a username.
+  if (email && !email.includes('@')) email = toEmail(email);
+  if (!email) throw new Error('Type your email.');
+  if (!password) throw new Error('Type your password.');
+  const res = await sb.auth.signInWithPassword({ email, password });
+  if (res.error) {
+    if (/confirm/i.test(res.error.message)) {
+      await sb.auth.resend({ type: 'signup', email }).catch(() => {});
+      throw needsCode(email, `Your email isn't verified yet. We sent a new code to ${email}.`);
     }
-    if (!res.data.session) throw new Error('Account made, but sign-in is waiting for email confirmation. Ask a grown-up to turn off "Confirm email" in Supabase.');
-  } else {
-    res = await sb.auth.signInWithPassword({ email, password });
-    if (res.error) throw new Error('Wrong username or password.');
+    throw new Error('Wrong email or password.');
   }
   return loadPlayer(res.data.user);
+}
+
+/** Check the code from the email and sign in. */
+export async function verifyCode(email, code) {
+  const token = String(code || '').replace(/\s+/g, '');
+  if (!/^\d{6,10}$/.test(token)) throw new Error('Type the number code from your email.');
+  let res = await sb.auth.verifyOtp({ email, token, type: 'email' });
+  if (res.error) res = await sb.auth.verifyOtp({ email, token, type: 'signup' });
+  if (res.error || !res.data.user) throw new Error('That code didn\'t work. Check it, or tap "Send a new code".');
+  return loadPlayer(res.data.user);
+}
+
+/** Email a fresh code. */
+export async function resendCode(email) {
+  const { error } = await sb.auth.resend({ type: 'signup', email });
+  if (error) throw new Error(/rate|seconds/i.test(error.message) ? 'Please wait a minute before asking for another code.' : error.message);
 }
 
 export async function signOut() {
