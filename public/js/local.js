@@ -1,40 +1,43 @@
-// Player accounts, saved online with Supabase (free plan).
-// Each player signs in with their email and a code we email them. Their coins, avatar,
-// unlocked items, stats and today's play time follow them to any device.
+// Family accounts, saved online with Supabase (free plan).
+// A parent logs in with THEIR email and a code we email to them. One parent
+// account holds the children's players. Each child's coins, avatar, unlocked
+// items, stats and today's play time follow them to any device.
 //
 // The key below is Supabase's *publishable* key: it is meant to be public.
-// The database only lets a signed-in player read and change their own row.
+// The database only lets a signed-in parent read and change their own family.
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/+esm';
 import { DEFAULT_AVATAR, freeItemIds, sanitizeAvatar, ITEM_BY_ID } from '/shared/cosmetics.js';
+import { readToday, writeToday, setPlaytimePlayer } from './playtime.js';
 
 // ---- SETTINGS --------------------------------------------------------------
 const SUPABASE_URL = 'https://qivxncxpbrjxspicgbls.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_poHAKWFmGFrkonSkv3-XCA_cmzfkdri';
-// Players only type a username. Supabase needs an email, so we make one up.
-const EMAIL_DOMAIN = 'players.friendarcade.app';
+// How long after typing a code the Parents area stays open without a new code.
+const PARENT_OPEN_MS = 10 * 60 * 1000;
 // ---------------------------------------------------------------------------
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, storageKey: 'fa_auth' },
 });
 
-const OLD_KEY = 'fa_profiles'; // progress saved on this device before logins existed
-const PLAYTIME_KEY = 'fa_playtime'; // same key playtime.js uses
+const PICK_KEY = 'fa_player'; // which child last played on this device
 
-let userId = null;
+let parent = null; // the signed-in parent (Supabase user)
+let userId = null; // players.id of the child who is playing
 let current = null;
-
-const toEmail = (name) => `${name.toLowerCase()}@${EMAIL_DOMAIN}`;
+let parentOkUntil = 0;
 
 function fromRow(r) {
   return {
     id: r.game_id,
+    rowId: r.id,
     username: r.username,
     coins: r.coins,
     avatar: { ...DEFAULT_AVATAR, ...(r.avatar || {}) },
     unlocked: Array.isArray(r.unlocked) && r.unlocked.length ? r.unlocked : freeItemIds(),
     stats: r.stats || {},
     awarded: r.awarded || [],
+    playtime: r.playtime || null,
   };
 }
 
@@ -49,87 +52,119 @@ function toRow(p) {
   };
 }
 
-function oldDeviceProfile(username) {
-  try {
-    return (JSON.parse(localStorage.getItem(OLD_KEY)) || {})[username.toLowerCase()] || null;
-  } catch {
-    return null;
-  }
-}
-
 function newGameId() {
   const a = new Uint32Array(1);
   crypto.getRandomValues(a);
   return 1 + (a[0] % 2147483646);
 }
 
-let pendingUser = null;
-
-/** Load this player's saved row. Returns null if they still need to pick a player name. */
-async function loadPlayer(user) {
-  userId = user.id;
-  const { data, error } = await sb.from('players').select('*').eq('id', userId).maybeSingle();
-  if (error) throw new Error(`Couldn't load your player: ${error.message}`);
-  if (!data) {
-    pendingUser = user;
+function remember(id) {
+  try {
+    if (id) localStorage.setItem(PICK_KEY, id);
+    else localStorage.removeItem(PICK_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+function remembered() {
+  try {
+    return localStorage.getItem(PICK_KEY);
+  } catch {
     return null;
   }
-  current = fromRow(data);
-  await syncPlaytime();
-  return current;
 }
 
-/** First sign-in: make the player with the name they picked. */
-export async function createPlayer(nameIn) {
+/** Who's signed in: { email, kids }. */
+export function family() {
+  return parent ? { email: parent.email } : null;
+}
+
+/** The children's players on this parent account. */
+export async function listKids() {
+  if (!parent) throw new Error('Please log in again.');
+  const { data, error } = await sb.from('players').select('*').eq('parent_id', parent.id).order('created_at');
+  if (error) throw new Error(`Couldn't load your players: ${error.message}`);
+  return data.map(fromRow);
+}
+
+/** Parents area: add a child player. */
+export async function addKid(nameIn) {
   const username = String(nameIn || '').trim();
-  if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) throw new Error('Use 3-16 letters, numbers or _ for your player name.');
-  if (!pendingUser) throw new Error('Please sign in again.');
-  // Bring over coins/avatar this player already had on this device.
-  const old = oldDeviceProfile(username);
-  const p = {
-    id: old?.id || newGameId(),
-    username,
-    coins: old?.coins || 0,
-    avatar: old?.avatar || { ...DEFAULT_AVATAR },
-    unlocked: old?.unlocked || freeItemIds(),
-    stats: old?.stats || {},
-    awarded: old?.awarded || [],
-  };
-  const { error } = await sb.from('players').insert({ id: pendingUser.id, username, game_id: p.id, ...toRow(p) });
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) throw new Error('Use 3-16 letters, numbers or _ for the player name.');
+  if (!parent) throw new Error('Please log in again.');
+  const p = { id: newGameId(), username, coins: 0, avatar: { ...DEFAULT_AVATAR }, unlocked: freeItemIds(), stats: {}, awarded: [] };
+  const { error } = await sb.from('players').insert({ parent_id: parent.id, username, game_id: p.id, ...toRow(p) });
   if (error) {
     if (/duplicate|unique/i.test(error.message)) throw new Error('That player name is taken. Try another one.');
-    throw new Error(`Couldn't create your player: ${error.message}`);
+    throw new Error(`Couldn't add the player: ${error.message}`);
   }
-  pendingUser = null;
-  current = p;
-  await syncPlaytime();
+}
+
+/** Parents area: rename a child player. */
+export async function renameKid(rowId, nameIn) {
+  const username = String(nameIn || '').trim();
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) throw new Error('Use 3-16 letters, numbers or _ for the player name.');
+  const { error } = await sb.from('players').update({ username }).eq('id', rowId);
+  if (error) {
+    if (/duplicate|unique/i.test(error.message)) throw new Error('That player name is taken. Try another one.');
+    throw new Error(error.message);
+  }
+}
+
+/** Parents area: delete a child player and all their coins and items. */
+export async function removeKid(rowId) {
+  const { error } = await sb.from('players').delete().eq('id', rowId);
+  if (error) throw new Error(error.message);
+  if (remembered() === rowId) remember(null);
+}
+
+/** Pick which child is playing on this device. */
+export async function choosePlayer(rowId) {
+  const { data, error } = await sb.from('players').select('*').eq('id', rowId).maybeSingle();
+  if (error || !data) throw new Error("Couldn't load that player. Try again.");
+  userId = data.id;
+  current = fromRow(data);
+  remember(userId);
+  setPlaytimePlayer(userId);
+  lastPushedMs = -1;
+  await syncPlaytime(data.playtime);
   return current;
 }
 
-/** Signed in already on this device? Returns the player, or null. */
+/** Back to "Who's playing?" (stays logged in). */
+export async function switchPlayer() {
+  await flush();
+  await pushPlaytime();
+  userId = null;
+  current = null;
+  remember(null);
+  setPlaytimePlayer(null);
+}
+
+/**
+ * Logged in already on this device?
+ * Returns null (log in), { email, profile } (keep playing) or { email } (pick a player).
+ */
 export async function restore() {
   const { data } = await sb.auth.getSession();
   const user = data?.session?.user;
   if (!user) return null;
-  try {
-    const p = await loadPlayer(user);
-    return p || { needsName: true };
-  } catch (e) {
-    console.warn(e);
-    return null;
+  parent = user;
+  const last = remembered();
+  if (last) {
+    try {
+      return { email: user.email, profile: await choosePlayer(last) };
+    } catch {
+      remember(null);
+    }
   }
+  return { email: user.email };
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const cleanEmail = (v) => String(v || '').trim().toLowerCase();
-function needsCode(email, message) {
-  const e = new Error(message);
-  e.needsCode = true;
-  e.email = email;
-  return e;
-}
 
-/** Email a login code. Makes the account the first time this email is used. */
+/** Email a login code to the parent. Makes the family account the first time. */
 export async function sendCode(emailIn) {
   const email = cleanEmail(emailIn);
   if (!EMAIL_RE.test(email)) throw new Error('Please type a real email address.');
@@ -141,22 +176,45 @@ export async function sendCode(emailIn) {
   return email;
 }
 
-/** Check the code from the email and sign in. Returns the player, or null if they need to pick a name. */
+/** Check the code from the parent's email and log in. Returns { email }. */
 export async function verifyCode(email, code) {
   const token = String(code || '').replace(/\s+/g, '');
-  if (!/^\d{6,10}$/.test(token)) throw new Error('Type the number code from your email.');
+  if (!/^\d{6,10}$/.test(token)) throw new Error('Type the number code from the email.');
   let res = await sb.auth.verifyOtp({ email, token, type: 'email' });
   if (res.error) res = await sb.auth.verifyOtp({ email, token, type: 'signup' });
   if (res.error || !res.data.user) throw new Error('That code didn\'t work. Check it, or tap "Send a new code".');
-  return loadPlayer(res.data.user);
+  parent = res.data.user;
+  parentOkUntil = Date.now() + PARENT_OPEN_MS;
+  return { email: parent.email };
+}
+
+/** Is the Parents area open, or does it need a fresh code from the parent's email? */
+export function parentAreaOpen() {
+  return !!parent && Date.now() < parentOkUntil;
+}
+
+/** Send a code to the parent's email to open the Parents area. */
+export async function sendParentCode() {
+  if (!parent) throw new Error('Please log in again.');
+  return sendCode(parent.email);
+}
+
+/** Open the Parents area with the code from the parent's email. */
+export async function unlockParentArea(code) {
+  if (!parent) throw new Error('Please log in again.');
+  await verifyCode(parent.email, code);
 }
 
 export async function signOut() {
   await flush();
   await pushPlaytime();
   await sb.auth.signOut().catch(() => {});
+  remember(null);
+  setPlaytimePlayer(null);
+  parent = null;
   userId = null;
   current = null;
+  parentOkUntil = 0;
 }
 
 // ---- saving ----------------------------------------------------------------
@@ -227,44 +285,33 @@ export function applyAward(profile, a) {
 }
 
 // ---- play time online ------------------------------------------------------
-// playtime.js counts time on this device. We also keep each player's time for
-// today online, so clearing the browser or switching devices doesn't reset it.
+// playtime.js counts each player's time on this device. We also keep it online,
+// so clearing the browser or switching devices doesn't reset it.
 function today() {
   const d = new Date();
   return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
-}
-function readLocalTime() {
-  try {
-    const v = JSON.parse(localStorage.getItem(PLAYTIME_KEY));
-    if (v && v.date === today()) return v;
-  } catch {
-    /* ignore */
-  }
-  return { date: today(), ms: 0 };
 }
 
 let lastPushedMs = -1;
 async function pushPlaytime() {
   if (!userId) return;
-  const v = readLocalTime();
+  const v = readToday();
   if (v.ms === lastPushedMs) return;
   lastPushedMs = v.ms;
   const { error } = await sb.from('players').update({ playtime: v }).eq('id', userId);
   if (error) console.warn('play time save failed', error.message);
 }
 
-async function syncPlaytime() {
-  const { data } = await sb.from('players').select('playtime').eq('id', userId).maybeSingle();
-  const cloud = data?.playtime;
-  const here = readLocalTime();
-  if (cloud && cloud.date === today() && cloud.ms > here.ms) {
-    try {
-      localStorage.setItem(PLAYTIME_KEY, JSON.stringify({ date: today(), ms: cloud.ms }));
-    } catch {
-      /* ignore */
-    }
-  }
+async function syncPlaytime(cloud) {
+  const here = readToday();
+  if (cloud && cloud.date === today() && cloud.ms > here.ms) writeToday(cloud.ms);
   await pushPlaytime();
+}
+
+/** Minutes a player has used today, from their saved row (for the Parents area). */
+export function minutesToday(p) {
+  const v = p.playtime;
+  return v && v.date === today() ? Math.round(v.ms / 60000) : 0;
 }
 
 setInterval(pushPlaytime, 60 * 1000);

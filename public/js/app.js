@@ -66,78 +66,210 @@ function setUrlRoom(code) {
 }
 
 // ---------------------------------------------------------------- auth
-// Sign in with email only: type your email, get a code by email, type the code.
-// The first time, you also pick a player name.
-let authMode = 'email'; // 'email' | 'code' | 'name'
+// Family logins:
+//   1. Type a PARENT's email. A code is emailed to the parent.
+//   2. Type the code (a grown-up reads it out).
+//   3. "Who's playing?" - pick a child player.
+// The Parents area adds, renames and removes child players. Opening it later
+// needs a fresh code from the parent's email, so kids can't change it.
+let authMode = 'email'; // 'email' | 'code' | 'pick' | 'parent' | 'parentcode'
 let pendingEmail = '';
-const authForm = $('auth-form');
+let familyEmail = '';
 document.querySelector('#screen-auth .tabs')?.classList.add('hidden');
-const userLabel = authForm.username.closest('label');
-const passLabel = authForm.password.closest('label');
-passLabel.style.display = 'none';
-authForm.password.required = false;
-userLabel.firstChild.textContent = 'Pick a player name ';
-const emailLabel = document.createElement('label');
-emailLabel.innerHTML = 'Your email <input name="email" type="email" inputmode="email" autocomplete="email" maxlength="120" />';
-authForm.insertBefore(emailLabel, userLabel);
-const info = document.createElement('p');
-info.className = 'muted';
-info.id = 'code-info';
-info.style.margin = '0 0 8px';
-authForm.insertBefore(info, emailLabel);
-const codeBox = document.createElement('div');
+const authForm = $('auth-form');
+authForm.username.closest('label').remove();
+authForm.password.closest('label').remove();
+
+const info = el('p', { class: 'muted', id: 'code-info', style: 'margin:0 0 8px' });
+const emailLabel = el('label', {});
+emailLabel.innerHTML = "Parent's email <input name=\"email\" type=\"email\" inputmode=\"email\" autocomplete=\"email\" maxlength=\"120\" />";
+const codeBox = el('div', {});
 codeBox.innerHTML =
-  '<label>Code from your email <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" /></label>' +
-  '<div style="display:flex;gap:8px;margin:6px 0 10px"><button type="button" class="ghost small" id="code-resend">Send a new code</button>' +
-  '<button type="button" class="ghost small" id="code-back">Use a different email</button></div>';
-authForm.insertBefore(codeBox, $('auth-submit'));
+  '<label>Code from the parent\'s email <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" /></label>' +
+  '<div style="display:flex;gap:8px;margin:6px 0 10px;justify-content:center;flex-wrap:wrap"><button type="button" class="ghost small" id="code-resend">Send a new code</button>' +
+  '<button type="button" class="ghost small" id="code-back">Back</button></div>';
+const pickBox = el('div', { class: 'family-pick' });
+const parentBox = el('div', { class: 'family-parent' });
+const note = el('p', { class: 'muted', style: 'margin-top:10px;font-size:.9em' });
+authForm.prepend(info, emailLabel, codeBox);
+authForm.insertBefore(pickBox, $('auth-submit'));
+authForm.insertBefore(parentBox, $('auth-submit'));
+authForm.append(note);
 
 function setAuthView() {
-  emailLabel.style.display = authMode === 'email' ? '' : 'none';
-  codeBox.style.display = authMode === 'code' ? '' : 'none';
-  userLabel.style.display = authMode === 'name' ? '' : 'none';
-  authForm.email.required = authMode === 'email';
-  authForm.code.required = authMode === 'code';
-  authForm.username.required = authMode === 'name';
+  const m = authMode;
+  emailLabel.style.display = m === 'email' ? '' : 'none';
+  codeBox.style.display = m === 'code' || m === 'parentcode' ? '' : 'none';
+  pickBox.style.display = m === 'pick' ? '' : 'none';
+  parentBox.style.display = m === 'parent' ? '' : 'none';
+  $('auth-submit').style.display = m === 'pick' || m === 'parent' ? 'none' : '';
+  authForm.email.required = m === 'email';
+  authForm.code.required = m === 'code' || m === 'parentcode';
+  $('code-back').textContent = m === 'parentcode' ? 'Back' : 'Use a different email';
   info.textContent =
-    authMode === 'email' ? 'Type your email and we\'ll send you a code to log in.'
-    : authMode === 'code' ? `We sent a code to ${pendingEmail}. Check your inbox (and spam), then type it below.`
-    : 'Welcome! Pick a name for your player.';
-  $('auth-submit').textContent = authMode === 'email' ? 'Send me a code' : authMode === 'code' ? 'Log in' : "Let's play!";
+    m === 'email' ? "Ask a grown-up to type their email. We'll send them a code to let you in."
+    : m === 'code' ? `We sent a code to ${pendingEmail}. Ask a grown-up to check that inbox (and spam), then type the code below.`
+    : m === 'parentcode' ? `Grown-ups only: we sent a code to ${familyEmail}. Type it to open the Parents area.`
+    : m === 'pick' ? "Who's playing?"
+    : '';
+  $('auth-submit').textContent = m === 'email' ? 'Send code to parent' : m === 'parentcode' ? 'Open Parents area' : 'Log in';
+  note.textContent = m === 'email' || m === 'code' ? 'Coins, avatar and play time are saved online for each child. Log in on any phone or tablet.' : '';
 }
 
 function goTo(mode) {
   authMode = mode;
   $('auth-error').textContent = '';
   setAuthView();
-  const f = { email: authForm.email, code: authForm.code, name: authForm.username }[mode];
-  setTimeout(() => f.focus(), 50);
+  show('auth');
+  const f = { email: authForm.email, code: authForm.code, parentcode: authForm.code }[mode];
+  if (f) setTimeout(() => f.focus(), 50);
 }
 
-$('code-back').addEventListener('click', () => goTo('email'));
+const authError = (err) => ($('auth-error').textContent = err.message || String(err));
+
+$('code-back').addEventListener('click', () => (authMode === 'parentcode' ? openPick() : goTo('email')));
 $('code-resend').addEventListener('click', async () => {
   $('auth-error').textContent = '';
   try {
-    await local.sendCode(pendingEmail);
-    info.textContent = `New code sent to ${pendingEmail}. Check your inbox (and spam).`;
+    if (authMode === 'parentcode') await local.sendParentCode();
+    else await local.sendCode(pendingEmail);
+    info.textContent = `New code sent to ${authMode === 'parentcode' ? familyEmail : pendingEmail}. Check the inbox (and spam).`;
   } catch (err) {
-    $('auth-error').textContent = err.message;
+    authError(err);
   }
 });
-setAuthView();
 
-(function authNote() {
-  const note = document.createElement('p');
-  note.className = 'muted';
-  note.style.cssText = 'margin-top:10px;font-size:.9em';
-  note.textContent = 'Your coins, avatar and play time are saved online. Log in with your email on any phone or tablet.';
-  authForm.append(note);
-})();
+// ---- Who's playing?
+async function openPick() {
+  goTo('pick');
+  pickBox.replaceChildren(el('p', { class: 'muted' }, 'Loading…'));
+  let kids = [];
+  try {
+    kids = await local.listKids();
+  } catch (err) {
+    authError(err);
+  }
+  const list = el('div', { class: 'kid-list' });
+  for (const k of kids) {
+    const b = el('button', { type: 'button', class: 'kid-btn' }, avatarCanvas(k.avatar, 56), el('span', {}, k.username));
+    b.addEventListener('click', async () => {
+      b.disabled = true;
+      try {
+        signedIn(await local.choosePlayer(k.rowId));
+      } catch (err) {
+        authError(err);
+        b.disabled = false;
+      }
+    });
+    list.append(b);
+  }
+  const parentsBtn = el('button', { type: 'button', class: 'secondary' }, '👪 Parents area');
+  parentsBtn.addEventListener('click', openParentArea);
+  const out = el('button', { type: 'button', class: 'ghost small' }, 'Log out');
+  out.addEventListener('click', logOut);
+  pickBox.replaceChildren(
+    kids.length ? list : el('p', {}, 'No players yet. A grown-up needs to add one in the Parents area.'),
+    el('div', { style: 'display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px' }, parentsBtn, out),
+    el('p', { class: 'muted', style: 'font-size:.85em;margin-top:8px' }, `Family: ${familyEmail}`),
+  );
+}
+
+// ---- Parents area
+async function openParentArea() {
+  $('auth-error').textContent = '';
+  if (!local.parentAreaOpen()) {
+    try {
+      await local.sendParentCode();
+      authForm.code.value = '';
+      goTo('parentcode');
+    } catch (err) {
+      authError(err);
+    }
+    return;
+  }
+  goTo('parent');
+  parentBox.replaceChildren(el('p', { class: 'muted' }, 'Loading…'));
+  let kids = [];
+  try {
+    kids = await local.listKids();
+  } catch (err) {
+    authError(err);
+  }
+  const rows = kids.map((k) => {
+    const rename = el('button', { type: 'button', class: 'ghost small' }, 'Rename');
+    const remove = el('button', { type: 'button', class: 'ghost small danger-text' }, 'Remove');
+    rename.addEventListener('click', async () => {
+      const name = prompt(`New player name for ${k.username}:`, k.username);
+      if (!name || name.trim() === k.username) return;
+      try {
+        await local.renameKid(k.rowId, name);
+        openParentArea();
+      } catch (err) {
+        authError(err);
+      }
+    });
+    remove.addEventListener('click', async () => {
+      if (!confirm(`Remove ${k.username}? Their coins, items and stats will be deleted for good.`)) return;
+      try {
+        await local.removeKid(k.rowId);
+        openParentArea();
+      } catch (err) {
+        authError(err);
+      }
+    });
+    return el(
+      'div',
+      { class: 'kid-row' },
+      avatarCanvas(k.avatar, 40),
+      el('div', { class: 'kid-info' }, el('b', {}, k.username), el('span', { class: 'muted' }, `● ${k.coins} coins · ${local.minutesToday(k)} min played today`)),
+      el('div', { class: 'kid-actions' }, rename, remove),
+    );
+  });
+  const addForm = el('div', { class: 'row', style: 'margin-top:10px' });
+  const nameIn = el('input', { placeholder: 'New player name', maxlength: '16', autocomplete: 'off' });
+  const addBtn = el('button', { type: 'button', class: 'primary' }, 'Add child');
+  const add = async () => {
+    $('auth-error').textContent = '';
+    addBtn.disabled = true;
+    try {
+      await local.addKid(nameIn.value);
+      openParentArea();
+    } catch (err) {
+      authError(err);
+      addBtn.disabled = false;
+    }
+  };
+  addBtn.addEventListener('click', add);
+  nameIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      add();
+    }
+  });
+  addForm.append(nameIn, addBtn);
+  const done = el('button', { type: 'button', class: 'secondary', style: 'margin-top:14px' }, "Done - who's playing?");
+  done.addEventListener('click', openPick);
+  parentBox.replaceChildren(
+    el('h2', { style: 'margin:0 0 4px' }, '👪 Parents area'),
+    el('p', { class: 'muted', style: 'margin:0 0 10px;font-size:.9em' }, `Codes to log in are sent to ${familyEmail}.`),
+    kids.length ? el('div', { class: 'kid-rows' }, ...rows) : el('p', {}, 'Add a player for each child.'),
+    addForm,
+    el('p', { class: 'hint' }, '3-16 letters, numbers or _. Each child gets their own coins, avatar and daily play time.'),
+    done,
+  );
+  setTimeout(() => nameIn.focus(), 50);
+}
+
+async function logOut() {
+  closeRoom();
+  await local.signOut();
+  location.href = location.pathname;
+}
+
+setAuthView();
 
 function signedIn(profile) {
   authForm.reset();
-  authMode = 'email';
-  setAuthView();
   startSession(profile);
   enterPendingRoom();
 }
@@ -154,24 +286,28 @@ authForm.addEventListener('submit', async (e) => {
       authForm.code.value = '';
       goTo('code');
     } else if (authMode === 'code') {
-      const profile = await local.verifyCode(pendingEmail, authForm.code.value);
-      if (profile) signedIn(profile);
-      else goTo('name');
-    } else {
-      signedIn(await local.createPlayer(authForm.username.value));
+      familyEmail = (await local.verifyCode(pendingEmail, authForm.code.value)).email;
+      const kids = await local.listKids().catch(() => []);
+      if (kids.length) openPick();
+      else openParentArea();
+    } else if (authMode === 'parentcode') {
+      await local.unlockParentArea(authForm.code.value);
+      openParentArea();
     }
   } catch (err) {
-    $('auth-error').textContent = err.message;
+    authError(err);
   } finally {
     btn.disabled = false;
     setAuthView();
   }
 });
 
-$('btn-signout').textContent = 'Sign out';
+// Top bar: switch to another child, or log the family out.
+$('btn-signout').textContent = 'Switch player';
 $('btn-signout').addEventListener('click', async () => {
   closeRoom();
-  await local.signOut();
+  await local.switchPlayer();
+  setUrlRoom(null);
   location.href = location.pathname;
 });
 
@@ -853,13 +989,11 @@ window.addEventListener('beforeunload', (e) => {
   local
     .restore()
     .catch(() => null)
-    .then((profile) => {
-      if (!profile) return show('auth');
-      if (profile.needsName) {
-        show('auth');
-        return goTo('name');
-      }
-      startSession(profile);
+    .then((fam) => {
+      if (!fam) return goTo('email');
+      familyEmail = fam.email;
+      if (!fam.profile) return openPick();
+      startSession(fam.profile);
       enterPendingRoom();
     });
 })();

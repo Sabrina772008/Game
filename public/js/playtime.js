@@ -2,7 +2,8 @@
 //   * At the Glenwood spot (within RADIUS_M): 3 hours a day.
 //   * Anywhere else, or if location is turned off: 2 hours a day.
 // Time counts while the game is open on screen. When it runs out the game
-// is blocked until midnight. Time is saved on this device.
+// is blocked until midnight. Each player has their own time, saved on this
+// device (and online by local.js). Nothing counts until a player is chosen.
 
 // ---- SETTINGS: change these to set the Glenwood spot -----------------------
 export const SPOT = { lat: -33.73894, lng: 150.94276 }; // 51 Angara Circuit, Glenwood NSW 2768
@@ -11,7 +12,8 @@ export const LIMIT_AT_SPOT_MIN = 180; // 3 hours
 export const LIMIT_ELSEWHERE_MIN = 120; // 2 hours
 // ---------------------------------------------------------------------------
 
-const KEY = 'fa_playtime';
+const BASE_KEY = 'fa_playtime';
+let KEY = null; // set per player by setPlaytimePlayer()
 const TICK_MS = 5000;
 const LOCATION_EVERY_MS = 5 * 60 * 1000;
 
@@ -28,6 +30,7 @@ function today() {
 }
 
 function load() {
+  if (!KEY) return { date: today(), ms: 0 };
   try {
     const v = JSON.parse(localStorage.getItem(KEY));
     if (v && v.date === today()) return v;
@@ -38,6 +41,7 @@ function load() {
 }
 
 function save(v) {
+  if (!KEY) return;
   try {
     localStorage.setItem(KEY, JSON.stringify(v));
   } catch {
@@ -174,6 +178,7 @@ function tick() {
   const step = document.visibilityState === 'visible' ? Math.min(now - lastTick, TICK_MS * 3) : 0;
   lastTick = now;
 
+  if (!KEY) return; // nobody is playing yet
   const v = load();
   if (v.date !== today()) warned = {};
   if (!blocked) {
@@ -198,6 +203,27 @@ function tick() {
     }
   }
   render();
+}
+
+/** Today's time for the current player: { date, ms }. */
+export function readToday() {
+  return load();
+}
+
+/** Replace today's time for the current player (used when the online copy is higher). */
+export function writeToday(ms) {
+  save({ date: today(), ms });
+  render();
+}
+
+/** Switch whose time is being counted. Pass null when nobody is playing. */
+export function setPlaytimePlayer(id) {
+  KEY = id ? `${BASE_KEY}_${id}` : null;
+  warned = {};
+  blocked = false;
+  document.getElementById('time-block')?.classList.add('hidden');
+  lastTick = Date.now();
+  if (KEY) tick();
 }
 
 export function isBlocked() {
