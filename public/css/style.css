@@ -289,3 +289,15 @@ body.in-game .call-controls button { width: 100%; }
 #location-gate { position: fixed; inset: 0; z-index: 99; background: rgba(10, 5, 30, 0.94); display: flex; align-items: center; justify-content: center; padding: 16px; text-align: center; }
 #location-gate .card { max-width: 440px; }
 #location-gate button { margin-top: 10px; }
+
+/* ---- Family login: who's playing + parents area ---- */
+.kid-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 10px; }
+.kid-btn { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 6px; background: #f1f3f5; box-shadow: none; border: 2px solid transparent; font-weight: 800; word-break: break-word; }
+.kid-btn:hover, .kid-btn:focus { border-color: var(--pink); background: #fff0f6; }
+.kid-rows { display: flex; flex-direction: column; gap: 8px; text-align: left; }
+.kid-row { display: flex; align-items: center; gap: 10px; padding: 8px; background: #f8f9fa; border-radius: 12px; }
+.kid-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.kid-info .muted { font-size: 0.8rem; }
+.kid-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.danger-text { color: var(--red); }
+.family-parent .row input { flex: 1; min-width: 0; }
