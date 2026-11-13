@@ -1,5 +1,5 @@
 // Player accounts, saved online with Supabase (free plan).
-// Each player signs in with a username + password, and their coins, avatar,
+// Each player signs in with their email and a code we email them. Their coins, avatar,
 // unlocked items, stats and today's play time follow them to any device.
 //
 // The key below is Supabase's *publishable* key: it is meant to be public.
@@ -63,30 +63,45 @@ function newGameId() {
   return 1 + (a[0] % 2147483646);
 }
 
-/** Load this player's saved row, creating it the first time. */
+let pendingUser = null;
+
+/** Load this player's saved row. Returns null if they still need to pick a player name. */
 async function loadPlayer(user) {
   userId = user.id;
   const { data, error } = await sb.from('players').select('*').eq('id', userId).maybeSingle();
   if (error) throw new Error(`Couldn't load your player: ${error.message}`);
-  if (data) {
-    current = fromRow(data);
-  } else {
-    const username = user.user_metadata?.username || user.email.split('@')[0];
-    // Bring over coins/avatar this player already had on this device.
-    const old = oldDeviceProfile(username);
-    const p = {
-      id: old?.id || newGameId(),
-      username,
-      coins: old?.coins || 0,
-      avatar: old?.avatar || { ...DEFAULT_AVATAR },
-      unlocked: old?.unlocked || freeItemIds(),
-      stats: old?.stats || {},
-      awarded: old?.awarded || [],
-    };
-    const { error: e2 } = await sb.from('players').insert({ id: userId, username, game_id: p.id, ...toRow(p) });
-    if (e2) throw new Error(`Couldn't create your player: ${e2.message}`);
-    current = p;
+  if (!data) {
+    pendingUser = user;
+    return null;
   }
+  current = fromRow(data);
+  await syncPlaytime();
+  return current;
+}
+
+/** First sign-in: make the player with the name they picked. */
+export async function createPlayer(nameIn) {
+  const username = String(nameIn || '').trim();
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) throw new Error('Use 3-16 letters, numbers or _ for your player name.');
+  if (!pendingUser) throw new Error('Please sign in again.');
+  // Bring over coins/avatar this player already had on this device.
+  const old = oldDeviceProfile(username);
+  const p = {
+    id: old?.id || newGameId(),
+    username,
+    coins: old?.coins || 0,
+    avatar: old?.avatar || { ...DEFAULT_AVATAR },
+    unlocked: old?.unlocked || freeItemIds(),
+    stats: old?.stats || {},
+    awarded: old?.awarded || [],
+  };
+  const { error } = await sb.from('players').insert({ id: pendingUser.id, username, game_id: p.id, ...toRow(p) });
+  if (error) {
+    if (/duplicate|unique/i.test(error.message)) throw new Error('That player name is taken. Try another one.');
+    throw new Error(`Couldn't create your player: ${error.message}`);
+  }
+  pendingUser = null;
+  current = p;
   await syncPlaytime();
   return current;
 }
@@ -97,7 +112,8 @@ export async function restore() {
   const user = data?.session?.user;
   if (!user) return null;
   try {
-    return await loadPlayer(user);
+    const p = await loadPlayer(user);
+    return p || { needsName: true };
   } catch (e) {
     console.warn(e);
     return null;
@@ -113,44 +129,19 @@ function needsCode(email, message) {
   return e;
 }
 
-/** Make a new account. Returns the player, or null when an email code is needed. */
-export async function signUp(emailIn, username, password) {
+/** Email a login code. Makes the account the first time this email is used. */
+export async function sendCode(emailIn) {
   const email = cleanEmail(emailIn);
-  const name = String(username || '').trim();
   if (!EMAIL_RE.test(email)) throw new Error('Please type a real email address.');
-  if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) throw new Error('Use 3-16 letters, numbers or _ for your player name.');
-  if (String(password || '').length < 6) throw new Error('Your password needs at least 6 characters.');
-  const res = await sb.auth.signUp({ email, password, options: { data: { username: name } } });
-  if (res.error) {
-    if (/already|registered|exists/i.test(res.error.message)) throw new Error('That email already has an account. Sign in instead.');
-    if (/rate limit/i.test(res.error.message)) throw new Error('Too many emails sent. Please wait a while and try again.');
-    throw new Error(res.error.message);
+  const { error } = await sb.auth.signInWithOtp({ email, options: { shouldCreateUser: true } });
+  if (error) {
+    if (/rate|seconds|security purposes/i.test(error.message)) throw new Error('Please wait a minute before asking for another code.');
+    throw new Error(error.message);
   }
-  if (res.data.session) return loadPlayer(res.data.user);
-  const ids = res.data.user && res.data.user.identities;
-  if (Array.isArray(ids) && ids.length === 0) throw new Error('That email already has an account. Sign in instead.');
-  return null;
+  return email;
 }
 
-/** Sign in with email + password. */
-export async function signIn(emailIn, password) {
-  let email = cleanEmail(emailIn);
-  // Accounts made before emails were needed signed in with just a username.
-  if (email && !email.includes('@')) email = toEmail(email);
-  if (!email) throw new Error('Type your email.');
-  if (!password) throw new Error('Type your password.');
-  const res = await sb.auth.signInWithPassword({ email, password });
-  if (res.error) {
-    if (/confirm/i.test(res.error.message)) {
-      await sb.auth.resend({ type: 'signup', email }).catch(() => {});
-      throw needsCode(email, `Your email isn't verified yet. We sent a new code to ${email}.`);
-    }
-    throw new Error('Wrong email or password.');
-  }
-  return loadPlayer(res.data.user);
-}
-
-/** Check the code from the email and sign in. */
+/** Check the code from the email and sign in. Returns the player, or null if they need to pick a name. */
 export async function verifyCode(email, code) {
   const token = String(code || '').replace(/\s+/g, '');
   if (!/^\d{6,10}$/.test(token)) throw new Error('Type the number code from your email.');
@@ -158,12 +149,6 @@ export async function verifyCode(email, code) {
   if (res.error) res = await sb.auth.verifyOtp({ email, token, type: 'signup' });
   if (res.error || !res.data.user) throw new Error('That code didn\'t work. Check it, or tap "Send a new code".');
   return loadPlayer(res.data.user);
-}
-
-/** Email a fresh code. */
-export async function resendCode(email) {
-  const { error } = await sb.auth.resend({ type: 'signup', email });
-  if (error) throw new Error(/rate|seconds/i.test(error.message) ? 'Please wait a minute before asking for another code.' : error.message);
 }
 
 export async function signOut() {
